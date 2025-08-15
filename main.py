@@ -1,11 +1,12 @@
 # backend/main.py
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Body
 from fastapi.responses import FileResponse
+from pydantic import create_model, Field, BaseModel,ConfigDict
 import pandas as pd
 import numpy as np
 import sqlite3
 import os
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import hashlib
 import json
 from datetime import datetime, timezone
@@ -109,6 +110,26 @@ def _json_safe_scalar(x: Any) -> Any:
     return x
 
 
+def get_publication_template() -> Dict[str, Any]:
+    """
+    Build a template dict for adding a publication.
+    Excludes id and unique_key because those are auto-generated.
+    All keys from EXPECTED_COLUMNS present and default to None.
+    """
+    template = {}
+    for c in EXPECTED_COLUMNS:
+        template[c] = None
+    return template
+
+
+def get_export_person_template() -> Dict[str, Any]:
+    """
+    Template for the export-person-pubs-pdf endpoint so the user knows what to pass.
+    'name' is the exact Faculty string; start_year and end_year are optional inclusives.
+    """
+    return {"name": "", "start_year": None, "end_year": None}
+
+
 # ---------------- DB init + migration ----------------
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -126,13 +147,15 @@ def init_db():
         """)
         conn.commit()
 
-        # If publications table doesn't exist at all, create fresh schema
+        # If publications table doesn't exist at all, create fresh schema.
+        # NOTE: unique_key is kept as a regular TEXT column (no UNIQUE constraint),
+        # because we will rely on 'id' as the authoritative identifier.
         cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (TABLE_NAME,))
         if not cur.fetchone():
             cur.execute(f"""
                 CREATE TABLE {TABLE_NAME} (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    unique_key TEXT UNIQUE,
+                    unique_key TEXT,
                     [Entry Date] TEXT,
                     Faculty TEXT,
                     [Publication Type] TEXT,
@@ -158,7 +181,7 @@ def init_db():
 def migrate_table_if_needed(conn: sqlite3.Connection):
     """
     If the existing publications table lacks 'id' or 'unique_key' (old schema),
-    migrate data into a new table with the desired schema.
+    migrate data into a new table with the desired schema (unique_key NOT UNIQUE).
     """
     cur = conn.cursor()
     # Read table info
@@ -170,13 +193,13 @@ def migrate_table_if_needed(conn: sqlite3.Connection):
     if "id" in existing_cols and "unique_key" in existing_cols:
         return
 
-    # Otherwise we need to migrate
+    # Otherwise we need to migrate into a new table WITHOUT unique constraint on unique_key
     tmp_table = f"{TABLE_NAME}_new"
-    # Create new table with correct schema
+    # Create new table with correct schema (unique_key is plain TEXT)
     cur.execute(f"""
         CREATE TABLE IF NOT EXISTS {tmp_table} (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            unique_key TEXT UNIQUE,
+            unique_key TEXT,
             [Entry Date] TEXT,
             Faculty TEXT,
             [Publication Type] TEXT,
@@ -202,7 +225,7 @@ def migrate_table_if_needed(conn: sqlite3.Connection):
         rows = []
         col_names = []
 
-    # For each old row, map fields to expected columns, generate unique_key and insert into new table
+    # For each old row, map fields to expected columns and insert into the new table
     for row in rows:
         rowdict = dict(zip(col_names, row))
         # Build a row_values dict for expected columns
@@ -229,7 +252,7 @@ def migrate_table_if_needed(conn: sqlite3.Connection):
                     except Exception:
                         v = None
             row_values[c] = v
-        # generate unique_key from Title/Faculty/Year (fall back to hashing whole row if empty)
+        # generate unique_key from Title/Faculty/Year as a hint (not enforced unique now)
         ukey = generate_unique_key(rowdict)
         # Insert into new table
         cols = ["unique_key"] + EXPECTED_COLUMNS + ["source", "last_modified"]
@@ -244,7 +267,6 @@ def migrate_table_if_needed(conn: sqlite3.Connection):
                 values.append(str(vv))
         values.append(rowdict.get("source", "migrated"))  # mark migrated rows' source
         values.append(rowdict.get("last_modified", None))
-        # Use the pre-built quoted column list in the f-string to avoid backslash issues
         cur.execute(f"INSERT OR IGNORE INTO {tmp_table} ({col_names_quoted}) VALUES ({placeholders})", values)
     conn.commit()
 
@@ -261,16 +283,20 @@ init_db()
 def db_get_all(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-    # SELECT * ORDER BY id (id should now exist after migration/init)
-    cur.execute(f"SELECT * FROM {TABLE_NAME} ORDER BY id")
+    # return rows ordered by Year desc, Entry Date desc, Title asc (logical ordering)
+    cur.execute(f'SELECT * FROM {TABLE_NAME} ORDER BY Year DESC, "Entry Date" DESC, Title ASC')
     rows = cur.fetchall()
     return [dict(r) for r in rows]
 
 
 def db_get_by_unique_key(conn: sqlite3.Connection, unique_key: str) -> Optional[Dict[str, Any]]:
+    """
+    Return the first row matching the unique_key (unique_key is no longer enforced UNIQUE).
+    This is used for CSV-merge heuristics; updates/deletes use 'id' only.
+    """
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-    cur.execute(f"SELECT * FROM {TABLE_NAME} WHERE unique_key = ?", (unique_key,))
+    cur.execute(f"SELECT * FROM {TABLE_NAME} WHERE unique_key = ? LIMIT 1", (unique_key,))
     row = cur.fetchone()
     return dict(row) if row else None
 
@@ -309,6 +335,10 @@ def db_insert(conn: sqlite3.Connection, unique_key: str, row_values: Dict[str, A
 
 
 def db_update(conn: sqlite3.Connection, pub_id: int, unique_key: str, row_values: Dict[str, Any], source: str, prev_row: Dict[str, Any]):
+    """
+    Update a publication by id. IMPORTANT: Do NOT modify unique_key here --
+    the 'id' is the authoritative identifier for updates.
+    """
     cur = conn.cursor()
     set_parts = []
     values = []
@@ -331,8 +361,7 @@ def db_update(conn: sqlite3.Connection, pub_id: int, unique_key: str, row_values
     set_parts.append("last_modified = ?")
     lm = now_iso()
     values.append(lm)
-    set_parts.append("unique_key = ?")
-    values.append(unique_key)
+    # DO NOT update unique_key on manual updates; keep existing unique_key as-is.
     sql = f"UPDATE {TABLE_NAME} SET {', '.join(set_parts)} WHERE id = ?"
     values.append(pub_id)
     cur.execute(sql, values)
@@ -353,6 +382,17 @@ def db_delete(conn: sqlite3.Connection, pub_id: int, prev_row: Dict[str, Any]):
         (pub_id, "delete", now_iso(), json.dumps(prev_row, default=str))
     )
     conn.commit()
+
+class ExportPersonPubsRequest(BaseModel):
+    """
+    Request model for /export-person-pubs-pdf
+    - name: exact Faculty string (required)
+    - start_year: optional inclusive start year (int)
+    - end_year: optional inclusive end year (int)
+    """
+    name: str = Field(..., title="Exact Faculty name", description="Exact Faculty string to match")
+    start_year: Optional[int] = Field(None, title="Start year (inclusive)")
+    end_year: Optional[int] = Field(None, title="End year (inclusive)")
 
 
 # ---------------- upload & merge ----------------
@@ -375,7 +415,7 @@ async def upload_publications(file: UploadFile = File(...)):
     # Clean and validate
     df = _clean_and_validate_df(df)
 
-    # Add unique_key
+    # Add unique_key (used for CSV matching heuristics)
     df["_unique_key"] = df.apply(generate_unique_key, axis=1)
 
     csv_import_time = datetime.now(timezone.utc)
@@ -387,7 +427,7 @@ async def upload_publications(file: UploadFile = File(...)):
         migrate_table_if_needed(conn)
 
         db_rows = db_get_all(conn)
-        db_keys = {r["unique_key"]: r for r in db_rows if r.get("unique_key")}
+        db_keys = {r.get("unique_key"): r for r in db_rows if r.get("unique_key")}
         incoming_keys = set(df["_unique_key"].tolist())
 
         added = []
@@ -452,7 +492,8 @@ async def upload_publications(file: UploadFile = File(...)):
                         if old_norm != new_norm:
                             changed_fields[c] = {"old": old_v, "new": new_norm}
                     if changed_fields:
-                        db_update(conn, existing["id"], ukey, incoming_record, source="csv", prev_row=prev_snapshot)
+                        # Use existing's unique_key (do not change unique_key on update)
+                        db_update(conn, existing["id"], existing.get("unique_key"), incoming_record, source="csv", prev_row=prev_snapshot)
                         # refresh db_keys entry after update
                         refreshed = db_get_by_unique_key(conn, ukey)
                         if refreshed:
@@ -466,8 +507,8 @@ async def upload_publications(file: UploadFile = File(...)):
             if k not in incoming_keys:
                 missing_in_csv.append({"id": r["id"], "unique_key": k, "Title": r.get("Title"), "Faculty": r.get("Faculty"), "Year": r.get("Year")})
 
-        # merged CSV (kept for record; previous "merged" behavior preserved)
-        merged = pd.read_sql(f"SELECT * FROM {TABLE_NAME} ORDER BY id", conn)
+        # merged CSV (kept for record; previous "merged" behavior preserved) - ordered logically
+        merged = pd.read_sql(f'SELECT * FROM {TABLE_NAME} ORDER BY Year DESC, "Entry Date" DESC, Title ASC', conn)
         if "Entry Date" in merged.columns:
             merged["Entry Date"] = pd.to_datetime(merged["Entry Date"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
         merged_path = os.path.join(UPLOAD_FOLDER, f"merged_{ts}.csv")
@@ -493,15 +534,14 @@ async def upload_publications(file: UploadFile = File(...)):
 @app.get("/get-publications")
 def get_publications():
     conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute(f"SELECT * FROM {TABLE_NAME} ORDER BY id")
-    rows = cur.fetchall()
-    conn.close()
+    try:
+        rows = db_get_all(conn)
+    finally:
+        conn.close()
 
     result = []
-    for r in rows:
-        d = dict(r)
+    for d in rows:
+        # Normalize Entry Date and Year types for JSON response
         if d.get("Entry Date"):
             try:
                 d["Entry Date"] = pd.to_datetime(d["Entry Date"], errors="coerce").strftime("%Y-%m-%d %H:%M:%S")
@@ -512,6 +552,10 @@ def get_publications():
                 d["Year"] = int(d["Year"])
             except Exception:
                 pass
+        # Ensure JSON-safe None for nulls
+        for k, v in list(d.items()):
+            if pd.isna(v):
+                d[k] = None
         result.append(d)
     return {"data": result}
 
@@ -535,6 +579,10 @@ def search_publications(title: str):
 
 @app.put("/update-publication/{pub_id}")
 def update_publication(pub_id: int, payload: Dict[str, Any]):
+    """
+    Update by ID. Do NOT recalculate or overwrite unique_key here.
+    Only fields present in EXPECTED_COLUMNS are updated; missing fields keep previous values.
+    """
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
@@ -550,9 +598,9 @@ def update_publication(pub_id: int, payload: Dict[str, Any]):
             update_vals[c] = payload[c]
         else:
             update_vals[c] = prev.get(c)
-    series = pd.Series({k: update_vals.get(k) for k in EXPECTED_COLUMNS})
-    new_ukey = generate_unique_key(series)
-    db_update(conn, pub_id, new_ukey, update_vals, source="manual", prev_row=prev)
+    # Use existing unique_key when updating (do not change it)
+    existing_ukey = prev.get("unique_key")
+    db_update(conn, pub_id, existing_ukey, update_vals, source="manual", prev_row=prev)
     conn.close()
     return {"message": "Updated", "id": pub_id}
 
@@ -602,7 +650,7 @@ def export_latest():
     """
     conn = sqlite3.connect(DB_FILE)
     try:
-        df = pd.read_sql(f"SELECT * FROM {TABLE_NAME} ORDER BY id", conn)
+        df = pd.read_sql(f'SELECT * FROM {TABLE_NAME} ORDER BY Year DESC, "Entry Date" DESC, Title ASC', conn)
     finally:
         conn.close()
 
@@ -619,3 +667,384 @@ def export_latest():
     df.to_csv(path, index=False)
 
     return FileResponse(path, filename=filename, media_type="text/csv")
+
+
+# ---------------- dynamic Pydantic model from DB schema ----------------
+def _get_db_columns_for_create() -> List[Tuple[str, type]]:
+    """
+    Query the DB schema and return a list of (column_name, python_type) for
+    columns that should be present in the create model.
+    Excludes id, unique_key, source, last_modified.
+    """
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cur = conn.cursor()
+        cur.execute(f"PRAGMA table_info({TABLE_NAME})")
+        info = cur.fetchall()  # (cid, name, type, notnull, dflt_value, pk)
+        conn.close()
+    except Exception:
+        info = []
+
+    cols: List[Tuple[str, type]] = []
+    if not info:
+        # fallback to EXPECTED_COLUMNS
+        for c in EXPECTED_COLUMNS:
+            if c == "Year":
+                cols.append((c, Optional[int]))
+            else:
+                cols.append((c, Optional[str]))
+        return cols
+
+    for col in info:
+        name = col[1]
+        if name in ("id", "unique_key", "source", "last_modified"):
+            continue
+        # map sqlite type hint or known column names to pydantic types
+        if name == "Year":
+            cols.append((name, Optional[int]))
+        elif name == "Entry Date":
+            # keep as string in input; we'll parse it later
+            cols.append((name, Optional[str]))
+        else:
+            cols.append((name, Optional[str]))
+    # If DB schema missing any expected column, ensure expected ones included
+    existing_names = [n for n, _ in cols]
+    for c in EXPECTED_COLUMNS:
+        if c not in existing_names:
+            if c == "Year":
+                cols.append((c, Optional[int]))
+            elif c == "Entry Date":
+                cols.append((c, Optional[str]))
+            else:
+                cols.append((c, Optional[str]))
+    return cols
+
+
+def _make_safe_field_name(name: str, used: set) -> str:
+    # Replace non-alnum with underscore and collapse duplicates
+    safe = "".join(ch if ch.isalnum() else "_" for ch in name).strip("_")
+    if not safe:
+        safe = "field"
+    # ensure it doesn't start with digit
+    if safe[0].isdigit():
+        safe = f"f_{safe}"
+    orig = safe
+    i = 1
+    while safe in used:
+        safe = f"{orig}_{i}"
+        i += 1
+    used.add(safe)
+    return safe
+
+
+# Build a dynamic model for creation (used in FastAPI docs)
+def build_publication_create_model():
+    # get desired columns (original names with spaces)
+    cols = _get_db_columns_for_create()
+    fields = {}
+    used = set()
+
+    for orig_name, ptype in cols:
+        safe_name = _make_safe_field_name(orig_name, used)
+        # alias keeps original DB column name in the OpenAPI schema
+        fields[safe_name] = (ptype, Field(None, alias=orig_name, title=orig_name))
+
+    class _Base(BaseModel):
+        # Pydantic v2 config
+        model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    # Pydantic v2 create_model: pass __base__ instead of __config__
+    model = create_model("PublicationCreate", __base__=_Base, **fields)
+    return model
+
+
+PublicationCreate = build_publication_create_model()
+
+
+# ---------------- new: add single publication endpoints ----------------
+@app.get("/add-publication/template")
+def add_publication_template():
+    """
+    Return a template JSON object that contains all expected columns (except id and unique_key)
+    set to null. This is intended for clients to fetch and present to users to fill.
+    """
+    template = get_publication_template()
+    return {"template": template, "note": "Fill any fields you want; id and unique_key are auto-generated on create."}
+
+
+@app.post("/add-publication", response_model=Dict[str, Any])
+def add_publication(payload: PublicationCreate = Body(...)): # type: ignore
+    """
+    Add a single publication via JSON (typed by PublicationCreate).
+    - Payload may include any of EXPECTED_COLUMNS (all optional).
+    - Missing fields become NULL.
+    - Entry Date defaults to now if not provided.
+    - Year coerced to int if possible.
+    - unique_key is generated from Title/Faculty/Year (not enforced UNIQUE).
+    - Returns the created publication row (including id).
+    """
+    # Convert payload -> dict using aliases so keys are the original DB column names (including spaces)
+    raw = payload.dict(by_alias=True, exclude_unset=True)
+
+    # Build row_values for DB insertion
+    row_values: Dict[str, Any] = {}
+    for c in EXPECTED_COLUMNS:
+        if c in raw:
+            v = raw[c]
+            if c == "Year":
+                try:
+                    v = int(v) if v is not None and str(v).strip() != "" else None
+                except Exception:
+                    v = None
+            if c == "Entry Date":
+                # Normalize entry date if provided
+                try:
+                    v_parsed = pd.to_datetime(v, errors="coerce")
+                    v = v_parsed.strftime("%Y-%m-%d %H:%M:%S") if not pd.isna(v_parsed) else None
+                except Exception:
+                    v = None
+            row_values[c] = v
+        else:
+            # default behavior for missing fields
+            if c == "Entry Date":
+                # default entry date -> now (string)
+                row_values[c] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                row_values[c] = None
+
+    # generate unique_key (as a hint — id is authoritative)
+    unique_key = generate_unique_key(row_values)
+
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        # ensure migration/schema up-to-date
+        migrate_table_if_needed(conn)
+
+        new_id = db_insert(conn, unique_key, row_values, source="manual")
+
+        # fetch inserted row
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(f"SELECT * FROM {TABLE_NAME} WHERE id = ?", (new_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=500, detail="Failed to retrieve inserted publication")
+
+        pub = dict(row)
+        # normalize types for JSON
+        if pub.get("Entry Date"):
+            try:
+                pub["Entry Date"] = pd.to_datetime(pub["Entry Date"], errors="coerce").strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                pass
+        if pub.get("Year") is not None:
+            try:
+                pub["Year"] = int(pub["Year"])
+            except Exception:
+                pass
+        # sanitize NaNs
+        for k, v in list(pub.items()):
+            if pd.isna(v):
+                pub[k] = None
+
+        return {"message": "Created", "publication": pub}
+    finally:
+        conn.close()
+
+
+# ---------------- PDF generation helper ----------------
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+
+
+def _sanitize_filename_part(s: str) -> str:
+    # simple sanitizer for file name sections
+    keep = "".join(ch if ch.isalnum() or ch in (" ", "-", "_") else "_" for ch in s)
+    return "_".join(keep.strip().split())
+
+
+def generate_person_pdf(name: str, rows: List[Dict[str, Any]], start_year: Optional[int], end_year: Optional[int], out_path: str):
+    styles = getSampleStyleSheet()
+    title_style = styles["Title"]
+    normal = styles["BodyText"]
+    small = ParagraphStyle("small", parent=styles["Normal"], fontSize=9)
+
+    doc = SimpleDocTemplate(out_path, pagesize=A4, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
+    elements: List[Any] = []
+
+    # Title
+    period = ""
+    if start_year is None and end_year is None:
+        period = "All years"
+    else:
+        s = start_year if start_year is not None else ""
+        e = end_year if end_year is not None else ""
+        period = f"{s} - {e}" if s or e else "All years"
+
+    elements.append(Paragraph(f"Publications for: {name}", title_style))
+    elements.append(Spacer(1, 8))
+    elements.append(Paragraph(f"Period: {period}", normal))
+    elements.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", small))
+    elements.append(Spacer(1, 12))
+
+    if not rows:
+        elements.append(Paragraph("No publications found for the requested person and period.", normal))
+        doc.build(elements)
+        return
+
+    # For each publication, add a block
+    for idx, r in enumerate(rows, start=1):
+        # Header for the publication
+        header = f"{idx}. {r.get('Title') or '(No title)'}"
+        elements.append(Paragraph(header, styles["Heading3"]))
+        elements.append(Spacer(1, 4))
+
+        # Build two-column table of key/value pairs
+        kv = []
+        def safe(val):
+            if val is None:
+                return ""
+            # for timestamps, ensure string
+            if isinstance(val, (pd.Timestamp, datetime)):
+                try:
+                    return pd.to_datetime(val).strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    return str(val)
+            return str(val)
+
+        fields_to_show = [
+            ("Year", r.get("Year")),
+            ("Publication Type", r.get("Publication Type")),
+            ("Role", r.get("Role")),
+            ("Faculty / Author", r.get("Faculty")),
+            ("Affiliation", r.get("Affiliation")),
+            ("Status", r.get("Status")),
+            ("Entry Date", r.get("Entry Date")),
+            ("Theme", r.get("Theme")),
+        ]
+        for k, v in fields_to_show:
+            kv.append([Paragraph(f"<b>{k}</b>", small), Paragraph(safe(v), small)])
+
+        # Add Reference in full width below if exists
+        t = Table(kv, colWidths=[100, 420])
+        t.setStyle(TableStyle([
+            ("VALIGN", (0,0), (-1,-1), "TOP"),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+        ]))
+        elements.append(t)
+
+        if r.get("Reference"):
+            elements.append(Spacer(1, 4))
+            elements.append(Paragraph("<b>Reference:</b>", small))
+            elements.append(Paragraph(safe(r.get("Reference")), small))
+        elements.append(Spacer(1, 10))
+
+        # Add a faint horizontal rule
+        hr = Table([[""]], colWidths=[520])
+        hr.setStyle(TableStyle([("LINEBELOW", (0,0), (-1,-1), 0.25, colors.grey)]))
+        elements.append(hr)
+        elements.append(Spacer(1, 10))
+
+    doc.build(elements)
+
+
+# ---------------- new: export publications for a person as PDF ----------------
+@app.post("/export-person-pubs-pdf", response_class=FileResponse)
+def export_person_pubs_pdf(
+    payload: ExportPersonPubsRequest = Body(
+        ...,
+        examples={
+            "range": {
+                "summary": "Name with year range",
+                "value": {"name": "Dr. Jane Doe", "start_year": 2019, "end_year": 2024},
+            },
+            "all_years": {
+                "summary": "Just a name (all years)",
+                "value": {"name": "Dr. Jane Doe"},
+            },
+        },
+    )
+):
+    """
+    Single endpoint: Accepts a JSON body with 'name' (required), 'start_year' and 'end_year' (optional).
+    Returns a PDF file containing all matching publications for the exact Faculty name filtered by Year.
+    """
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Field 'name' (exact faculty name) is required.")
+
+    start_year = payload.start_year
+    end_year = payload.end_year
+
+
+    # Query DB for exact Faculty match and Year range
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    # Build SQL and parameters
+    sql = f"SELECT * FROM {TABLE_NAME} WHERE Faculty = ?"
+    params: List[Any] = [name]
+    if start_year is not None and end_year is not None:
+        sql += " AND Year BETWEEN ? AND ?"
+        params.extend([start_year, end_year])
+    elif start_year is not None:
+        sql += " AND Year >= ?"
+        params.append(start_year)
+    elif end_year is not None:
+        sql += " AND Year <= ?"
+        params.append(end_year)
+
+    sql += ' ORDER BY Year DESC, "Entry Date" DESC, Title ASC'
+
+    try:
+        cur.execute(sql, tuple(params))
+        rows = cur.fetchall()
+        publications = [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+    # Normalize fields for PDF
+    for p in publications:
+        if p.get("Entry Date"):
+            try:
+                p["Entry Date"] = pd.to_datetime(p["Entry Date"], errors="coerce").strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                pass
+        if p.get("Year") is not None:
+            try:
+                p["Year"] = int(p["Year"])
+            except Exception:
+                pass
+        # sanitize NaNs
+        for k, v in list(p.items()):
+            if pd.isna(v):
+                p[k] = None
+
+    # Build outfile path
+    safe_name = _sanitize_filename_part(name)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{safe_name}_publications_{ts}.pdf"
+    out_path = os.path.join(UPLOAD_FOLDER, filename)
+
+    # Generate PDF
+    try:
+        generate_person_pdf(name, publications, start_year, end_year, out_path)
+    except Exception as e:
+        # If PDF generation fails, ensure no partial file remains
+        if os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except Exception:
+                pass
+        raise HTTPException(status_code=500, detail=f"Failed to generate PDF: {e}")
+
+    # Return file response
+    return FileResponse(out_path, filename=filename, media_type="application/pdf")
+{
+  "name": "Dr. Alice Smith",
+  "start_year": 2019,
+  "end_year": 2022
+}
