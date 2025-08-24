@@ -1,7 +1,7 @@
 # backend/main.py
-from fastapi import FastAPI, File, UploadFile, HTTPException, Body
+from fastapi import FastAPI, File, UploadFile, HTTPException, Body, Query
 from fastapi.responses import FileResponse
-from pydantic import create_model, Field, BaseModel,ConfigDict
+from pydantic import create_model, Field, BaseModel, ConfigDict
 import pandas as pd
 import numpy as np
 import sqlite3
@@ -10,9 +10,37 @@ from typing import List, Dict, Any, Optional, Tuple
 import hashlib
 import json
 from datetime import datetime, timezone
+from collections import defaultdict
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi import Depends
+import secrets
 
 app = FastAPI()
+security = HTTPBasic()
 
+USERNAME = "admin"
+PASSWORD = "supersecretpassword"
+
+def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
+    is_correct_username = secrets.compare_digest(credentials.username, USERNAME)
+    is_correct_password = secrets.compare_digest(credentials.password, PASSWORD)
+    if not (is_correct_username and is_correct_password):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  #frontend URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 UPLOAD_FOLDER = "uploads"
 DB_FILE = "data.db"
 TABLE_NAME = "publications"
@@ -126,8 +154,9 @@ def get_export_person_template() -> Dict[str, Any]:
     """
     Template for the export-person-pubs-pdf endpoint so the user knows what to pass.
     'name' is the exact Faculty string; start_year and end_year are optional inclusives.
+    If 'name' is omitted, endpoint will return publications for ALL faculty (subject to year filters).
     """
-    return {"name": "", "start_year": None, "end_year": None}
+    return {"name": None, "start_year": None, "end_year": None}
 
 
 # ---------------- DB init + migration ----------------
@@ -275,6 +304,12 @@ def migrate_table_if_needed(conn: sqlite3.Connection):
     cur.execute(f"ALTER TABLE {tmp_table} RENAME TO {TABLE_NAME}")
     conn.commit()
 
+def get_model_fields(model):
+    """
+    Get a dict of field names and types for a Pydantic model.
+    """
+    return {name: str(field.annotation) for name, field in model.model_fields.items()}
+
 
 init_db()
 
@@ -383,17 +418,35 @@ def db_delete(conn: sqlite3.Connection, pub_id: int, prev_row: Dict[str, Any]):
     )
     conn.commit()
 
+
 class ExportPersonPubsRequest(BaseModel):
     """
     Request model for /export-person-pubs-pdf
-    - name: exact Faculty string (required)
+    - name: exact Faculty string (optional). If omitted or null => search ALL faculty.
     - start_year: optional inclusive start year (int)
     - end_year: optional inclusive end year (int)
     """
-    name: str = Field(..., title="Exact Faculty name", description="Exact Faculty string to match")
+    name: Optional[str] = Field(None, title="Exact Faculty name", description="Exact Faculty string to match; omit/null for all faculty")
     start_year: Optional[int] = Field(None, title="Start year (inclusive)")
     end_year: Optional[int] = Field(None, title="End year (inclusive)")
 
+
+class ExportPublicationsExcelRequest(BaseModel):
+    year: Optional[int] = Field(None, title="Year")
+    start_year: Optional[int] = Field(None, title="Start year (inclusive)")
+    end_year: Optional[int] = Field(None, title="End year (inclusive)")
+    faculty: Optional[str] = Field(None, title="Faculty name")
+
+
+class PersonStatisticsRequest(BaseModel):
+    faculty: str
+
+class PersonStatisticsResponse(BaseModel):
+    faculty: str
+    total_publications: int
+    role_counts: dict
+    status_counts: dict
+    yearly_counts: dict
 
 # ---------------- upload & merge ----------------
 @app.post("/upload-publications")
@@ -761,19 +814,8 @@ def build_publication_create_model():
 PublicationCreate = build_publication_create_model()
 
 
-# ---------------- new: add single publication endpoints ----------------
-@app.get("/add-publication/template")
-def add_publication_template():
-    """
-    Return a template JSON object that contains all expected columns (except id and unique_key)
-    set to null. This is intended for clients to fetch and present to users to fill.
-    """
-    template = get_publication_template()
-    return {"template": template, "note": "Fill any fields you want; id and unique_key are auto-generated on create."}
-
-
 @app.post("/add-publication", response_model=Dict[str, Any])
-def add_publication(payload: PublicationCreate = Body(...)): # type: ignore
+def add_publication(payload: PublicationCreate = Body(...)):  # type: ignore
     """
     Add a single publication via JSON (typed by PublicationCreate).
     - Payload may include any of EXPECTED_COLUMNS (all optional).
@@ -883,14 +925,14 @@ def generate_person_pdf(name: str, rows: List[Dict[str, Any]], start_year: Optio
         e = end_year if end_year is not None else ""
         period = f"{s} - {e}" if s or e else "All years"
 
-    elements.append(Paragraph(f"Publications for: {name}", title_style))
+    elements.append(Paragraph(f"Publications for: {name if name is not None else 'All Faculty'}", title_style))
     elements.append(Spacer(1, 8))
     elements.append(Paragraph(f"Period: {period}", normal))
     elements.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", small))
     elements.append(Spacer(1, 12))
 
     if not rows:
-        elements.append(Paragraph("No publications found for the requested person and period.", normal))
+        elements.append(Paragraph("No publications found for the requested criteria.", normal))
         doc.build(elements)
         return
 
@@ -953,49 +995,90 @@ def generate_person_pdf(name: str, rows: List[Dict[str, Any]], start_year: Optio
 # ---------------- new: export publications for a person as PDF ----------------
 @app.post("/export-person-pubs-pdf", response_class=FileResponse)
 def export_person_pubs_pdf(
-    payload: ExportPersonPubsRequest = Body(
-        ...,
+    payload: Optional[ExportPersonPubsRequest] = Body(
+        None,
         examples={
             "range": {
                 "summary": "Name with year range",
                 "value": {"name": "Dr. Jane Doe", "start_year": 2019, "end_year": 2024},
             },
-            "all_years": {
+            "all_years_name": {
                 "summary": "Just a name (all years)",
                 "value": {"name": "Dr. Jane Doe"},
+            },
+            "all_faculty_years": {
+                "summary": "No name (all faculty), with years",
+                "value": {"start_year": 2020, "end_year": 2021},
+            },
+            "all_faculty_all_years": {
+                "summary": "No body -> returns template",
+                "value": None,
             },
         },
     )
 ):
     """
-    Single endpoint: Accepts a JSON body with 'name' (required), 'start_year' and 'end_year' (optional).
-    Returns a PDF file containing all matching publications for the exact Faculty name filtered by Year.
+    Single endpoint:
+    - If called with no body (payload is null), returns a small template JSON explaining fields.
+    - If body provided:
+        - name (optional): exact Faculty string. If omitted or null => all faculty.
+        - start_year, end_year (optional): inclusive integer bounds for Year filtering.
+    Returns a PDF file containing matching publications.
     """
-    name = payload.name.strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Field 'name' (exact faculty name) is required.")
+    # If payload is None -> return template so UI knows what to send
+    if payload is None:
+        return {
+            "template": get_export_person_template(),
+            "note": "Provide 'name' (exact Faculty string) or omit/null for all faculty. 'start_year' and 'end_year' are optional inclusive integers."
+        }
+
+    # Extract and normalize inputs
+    name_raw = payload.name
+    name = name_raw.strip() if isinstance(name_raw, str) and name_raw.strip() != "" else None
 
     start_year = payload.start_year
     end_year = payload.end_year
+    try:
+        start_year = int(start_year) if start_year is not None and str(start_year).strip() != "" else None
+    except Exception:
+        raise HTTPException(status_code=400, detail="start_year must be an integer or omitted.")
+    try:
+        end_year = int(end_year) if end_year is not None and str(end_year).strip() != "" else None
+    except Exception:
+        raise HTTPException(status_code=400, detail="end_year must be an integer or omitted.")
 
+    # Treat 0 as "not provided" to avoid accidental Year=0 filtering
+    if isinstance(start_year, int) and start_year == 0:
+        start_year = None
+    if isinstance(end_year, int) and end_year == 0:
+        end_year = None
 
-    # Query DB for exact Faculty match and Year range
+    # Query DB for optional Faculty match and optional Year range
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
-    # Build SQL and parameters
-    sql = f"SELECT * FROM {TABLE_NAME} WHERE Faculty = ?"
-    params: List[Any] = [name]
+    # Base SQL
+    sql = f"SELECT * FROM {TABLE_NAME}"
+    params: List[Any] = []
+
+    # Build WHERE clauses depending on inputs
+    where_clauses: List[str] = []
+    if name is not None:
+        where_clauses.append("Faculty = ?")
+        params.append(name)
     if start_year is not None and end_year is not None:
-        sql += " AND Year BETWEEN ? AND ?"
+        where_clauses.append("Year BETWEEN ? AND ?")
         params.extend([start_year, end_year])
     elif start_year is not None:
-        sql += " AND Year >= ?"
+        where_clauses.append("Year >= ?")
         params.append(start_year)
     elif end_year is not None:
-        sql += " AND Year <= ?"
+        where_clauses.append("Year <= ?")
         params.append(end_year)
+
+    if where_clauses:
+        sql += " WHERE " + " AND ".join(where_clauses)
 
     sql += ' ORDER BY Year DESC, "Entry Date" DESC, Title ASC'
 
@@ -1024,14 +1107,14 @@ def export_person_pubs_pdf(
                 p[k] = None
 
     # Build outfile path
-    safe_name = _sanitize_filename_part(name)
+    safe_name_part = _sanitize_filename_part(name if name is not None else "ALL")
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{safe_name}_publications_{ts}.pdf"
+    filename = f"{safe_name_part}_publications_{ts}.pdf"
     out_path = os.path.join(UPLOAD_FOLDER, filename)
 
     # Generate PDF
     try:
-        generate_person_pdf(name, publications, start_year, end_year, out_path)
+        generate_person_pdf(name if name is not None else "All Faculty", publications, start_year, end_year, out_path)
     except Exception as e:
         # If PDF generation fails, ensure no partial file remains
         if os.path.exists(out_path):
@@ -1043,8 +1126,193 @@ def export_person_pubs_pdf(
 
     # Return file response
     return FileResponse(out_path, filename=filename, media_type="application/pdf")
-{
-  "name": "Dr. Alice Smith",
-  "start_year": 2019,
-  "end_year": 2022
-}
+
+@app.post("/export-publications-excel", response_class=FileResponse)
+def export_publications_excel(payload: ExportPublicationsExcelRequest = Body(...)):
+    """
+    Export publications as an Excel file.
+    Optional filters:
+      - year (single year)
+      - start_year, end_year (range, inclusive)
+      - faculty (exact name match)
+    """
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    sql = f"SELECT * FROM {TABLE_NAME}"
+    params = []
+    where_clauses = []
+
+    # Apply filters
+    if payload.year and (payload.start_year or payload.end_year):
+        raise HTTPException(
+            status_code=400,
+            detail="Please provide either 'year' OR 'start_year'/'end_year', not both."
+        )
+    if payload.faculty and payload.faculty.strip().lower() != "string":
+        where_clauses.append("Faculty = ?")
+        params.append(payload.faculty)
+
+    if payload.year and payload.year > 0:
+        where_clauses.append("Year = ?")
+        params.append(payload.year)
+    elif payload.start_year and payload.end_year and payload.start_year > 0 and payload.end_year > 0:
+        where_clauses.append("Year BETWEEN ? AND ?")
+        params.extend([payload.start_year, payload.end_year])
+    elif payload.start_year and payload.start_year > 0:
+        where_clauses.append("Year >= ?")
+        params.append(payload.start_year)
+    elif payload.end_year and payload.end_year > 0:
+        where_clauses.append("Year <= ?")
+        params.append(payload.end_year)
+
+    if where_clauses:
+        sql += " WHERE " + " AND ".join(where_clauses)
+
+    sql += ' ORDER BY Year DESC, "Entry Date" DESC, Title ASC'
+
+    cur.execute(sql, tuple(params))
+    rows = cur.fetchall()
+    conn.close()
+
+    df = pd.DataFrame([dict(r) for r in rows])
+
+    if df.empty:
+        raise HTTPException(status_code=404, detail="No publications found for the given filters")
+
+    # ✅ Drop internal-use columns
+    df = df.drop(columns=[c for c in ["id", "unique_key", "Entry Date", "last_modified", "source"] if c in df.columns], errors="ignore")
+
+    # Build filename
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filter_part = []
+    if payload.faculty:
+        filter_part.append(payload.faculty.replace(" ", "_"))
+    if payload.year:
+        filter_part.append(str(payload.year))
+    elif payload.start_year or payload.end_year:
+        filter_part.append(f"{payload.start_year or ''}-{payload.end_year or ''}")
+
+    filter_str = "_".join(filter_part) if filter_part else "ALL"
+    filename = f"publications_{filter_str}_{ts}.xlsx"
+    out_path = os.path.join(UPLOAD_FOLDER, filename)
+
+    # Save to Excel
+    df.to_excel(out_path, index=False)
+
+    return FileResponse(
+        out_path,
+        filename=filename,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+@app.post("/statistics/person", response_model=PersonStatisticsResponse)
+def get_person_statistics(payload: PersonStatisticsRequest = Body(...)):
+    """
+    Get statistics for a given faculty member:
+    - Total publications
+    - Role distribution (Main Author, Co-Author, etc.)
+    - Status distribution (Published, Unpublished, etc.)
+    - Yearly breakdown
+    """
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    # Fetch all rows for the given faculty
+    cur.execute(f"SELECT * FROM {TABLE_NAME} WHERE Faculty = ?", (payload.faculty,))
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"No publications found for {payload.faculty}")
+
+    df = pd.DataFrame([dict(r) for r in rows])
+
+    # Prepare statistics
+    total_publications = len(df)
+
+    # Count roles
+    role_counts = df["Role"].value_counts().to_dict() if "Role" in df.columns else {}
+
+    # Count status (Published, In-progress, etc.)
+    status_counts = df["Status"].value_counts().to_dict() if "Status" in df.columns else {}
+
+    # Count yearly publications
+    yearly_counts = df["Year"].value_counts().sort_index().to_dict() if "Year" in df.columns else {}
+
+    return PersonStatisticsResponse(
+        faculty=payload.faculty,
+        total_publications=total_publications,
+        role_counts=role_counts,
+        status_counts=status_counts,
+        yearly_counts=yearly_counts
+    )
+
+@app.get("/statistics/publications")
+def statistics_publications(
+    start_year: int = Query(None, description="Filter publications from this year onwards"),
+    end_year: int = Query(None, description="Filter publications up to this year")
+):
+    """
+    Get statistics of publications grouped by year:
+      - Total number of publications
+      - Total number of contributors (unique faculty) that year
+      - Average number of authors per publication
+    """
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    sql = f"SELECT Year, Title, Faculty FROM {TABLE_NAME}"
+    params = []
+    where_clauses = []
+
+    if start_year:
+        where_clauses.append("Year >= ?")
+        params.append(start_year)
+    if end_year:
+        where_clauses.append("Year <= ?")
+        params.append(end_year)
+
+    if where_clauses:
+        sql += " WHERE " + " AND ".join(where_clauses)
+
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="No publications found for the given filters")
+
+    # Process statistics
+    year_stats = defaultdict(lambda: {"publications": 0, "contributors": set(), "authors_per_pub": defaultdict(set)})
+
+    for row in rows:
+        year = row["Year"]
+        title = row["Title"]
+        faculty = row["Faculty"]
+
+        year_stats[year]["publications"] += 1
+        year_stats[year]["contributors"].add(faculty)
+        year_stats[year]["authors_per_pub"][title].add(faculty)
+
+    # Build response
+    result = []
+    for year, stats in sorted(year_stats.items()):
+        pub_count = stats["publications"]
+        contributors_count = len(stats["contributors"])
+        avg_authors = (
+            sum(len(authors) for authors in stats["authors_per_pub"].values()) /
+            len(stats["authors_per_pub"])
+        )
+        result.append({
+            "year": year,
+            "publications": pub_count,
+            "unique_contributors": contributors_count,
+            "average_authors_per_publication": round(avg_authors, 2)
+        })
+
+    return {"statistics": result}
+
