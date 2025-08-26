@@ -1,6 +1,6 @@
 # backend/main.py
 from fastapi import FastAPI, File, UploadFile, HTTPException, Body, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import create_model, Field, BaseModel, ConfigDict
 import pandas as pd
 import numpy as np
@@ -16,11 +16,13 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi import Depends
 import secrets
 
+
 app = FastAPI()
 security = HTTPBasic()
 
-USERNAME = "admin"
-PASSWORD = "supersecretpassword"
+
+USERNAME = os.getenv("APP_ADMIN_USERNAME", "admin")
+PASSWORD = os.getenv("APP_ADMIN_PASSWORD", "supersecretpassword")
 
 def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
     is_correct_username = secrets.compare_digest(credentials.username, USERNAME)
@@ -36,14 +38,14 @@ def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  #frontend URL
+    allow_origins=["*"],  
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 UPLOAD_FOLDER = "uploads"
 DB_FILE = "data.db"
-TABLE_NAME = "publications"
+TABLE_NAME = "publications" 
 HISTORY_TABLE = "publications_history"
 
 EXPECTED_COLUMNS: List[str] = [
@@ -449,7 +451,7 @@ class PersonStatisticsResponse(BaseModel):
     yearly_counts: dict
 
 # ---------------- upload & merge ----------------
-@app.post("/upload-publications")
+@app.post("/upload-publications",dependencies=[Depends(authenticate)])
 async def upload_publications(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only .csv files are allowed")
@@ -630,7 +632,7 @@ def search_publications(title: str):
     return {"matches": matches}
 
 
-@app.put("/update-publication/{pub_id}")
+@app.put("/update-publication/{pub_id}",dependencies=[Depends(authenticate)])
 def update_publication(pub_id: int, payload: Dict[str, Any]):
     """
     Update by ID. Do NOT recalculate or overwrite unique_key here.
@@ -658,7 +660,7 @@ def update_publication(pub_id: int, payload: Dict[str, Any]):
     return {"message": "Updated", "id": pub_id}
 
 
-@app.delete("/delete-publication/{pub_id}")
+@app.delete("/delete-publication/{pub_id}",dependencies=[Depends(authenticate)])
 def delete_publication(pub_id: int):
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
@@ -814,7 +816,7 @@ def build_publication_create_model():
 PublicationCreate = build_publication_create_model()
 
 
-@app.post("/add-publication", response_model=Dict[str, Any])
+@app.post("/add-publication", response_model=Dict[str, Any],dependencies=[Depends(authenticate)])
 def add_publication(payload: PublicationCreate = Body(...)):  # type: ignore
     """
     Add a single publication via JSON (typed by PublicationCreate).
@@ -993,7 +995,7 @@ def generate_person_pdf(name: str, rows: List[Dict[str, Any]], start_year: Optio
 
 
 # ---------------- new: export publications for a person as PDF ----------------
-@app.post("/export-person-pubs-pdf", response_class=FileResponse)
+@app.post("/export-person-pubs-pdf",dependencies=[Depends(authenticate)])
 def export_person_pubs_pdf(
     payload: Optional[ExportPersonPubsRequest] = Body(
         None,
@@ -1127,7 +1129,7 @@ def export_person_pubs_pdf(
     # Return file response
     return FileResponse(out_path, filename=filename, media_type="application/pdf")
 
-@app.post("/export-publications-excel", response_class=FileResponse)
+@app.post("/export-publications-excel", response_class=FileResponse,dependencies=[Depends(authenticate)])
 def export_publications_excel(payload: ExportPublicationsExcelRequest = Body(...)):
     """
     Export publications as an Excel file.
@@ -1150,9 +1152,10 @@ def export_publications_excel(payload: ExportPublicationsExcelRequest = Body(...
             status_code=400,
             detail="Please provide either 'year' OR 'start_year'/'end_year', not both."
         )
-    if payload.faculty and payload.faculty.strip().lower() != "string":
+    if payload.faculty and payload.faculty.strip() != "":
         where_clauses.append("Faculty = ?")
-        params.append(payload.faculty)
+        params.append(payload.faculty.strip())
+
 
     if payload.year and payload.year > 0:
         where_clauses.append("Year = ?")
@@ -1255,12 +1258,6 @@ def statistics_publications(
     start_year: int = Query(None, description="Filter publications from this year onwards"),
     end_year: int = Query(None, description="Filter publications up to this year")
 ):
-    """
-    Get statistics of publications grouped by year:
-      - Total number of publications
-      - Total number of contributors (unique faculty) that year
-      - Average number of authors per publication
-    """
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
@@ -1279,33 +1276,46 @@ def statistics_publications(
     if where_clauses:
         sql += " WHERE " + " AND ".join(where_clauses)
 
-    cur.execute(sql, params)
+    cur.execute(sql, tuple(params))
     rows = cur.fetchall()
     conn.close()
 
     if not rows:
         raise HTTPException(status_code=404, detail="No publications found for the given filters")
 
-    # Process statistics
-    year_stats = defaultdict(lambda: {"publications": 0, "contributors": set(), "authors_per_pub": defaultdict(set)})
-
+    # Aggregate while handling None years safely
+    year_stats = {}
     for row in rows:
         year = row["Year"]
-        title = row["Title"]
-        faculty = row["Faculty"]
+        title = row["Title"] or ""
+        faculty = row["Faculty"] or ""
 
-        year_stats[year]["publications"] += 1
-        year_stats[year]["contributors"].add(faculty)
-        year_stats[year]["authors_per_pub"][title].add(faculty)
+        # use str(year) for grouping of None/int; but keep int if possible
+        ykey = year if (isinstance(year, int) or (isinstance(year, str) and year.isdigit())) else None
 
-    # Build response
+        if ykey not in year_stats:
+            year_stats[ykey] = {"publications": 0, "contributors": set(), "authors_per_pub": {}}
+        year_stats[ykey]["publications"] += 1
+        if faculty:
+            year_stats[ykey]["contributors"].add(faculty)
+        if title not in year_stats[ykey]["authors_per_pub"]:
+            year_stats[ykey]["authors_per_pub"][title] = set()
+        if faculty:
+            year_stats[ykey]["authors_per_pub"][title].add(faculty)
+
+    # Build response sorted by year (None goes last)
+    sorted_years = sorted([y for y in year_stats.keys() if y is not None], reverse=True)
+    if None in year_stats:
+        sorted_years.append(None)
+
     result = []
-    for year, stats in sorted(year_stats.items()):
+    for year in sorted_years:
+        stats = year_stats[year]
         pub_count = stats["publications"]
         contributors_count = len(stats["contributors"])
         avg_authors = (
             sum(len(authors) for authors in stats["authors_per_pub"].values()) /
-            len(stats["authors_per_pub"])
+            max(1, len(stats["authors_per_pub"]))
         )
         result.append({
             "year": year,
@@ -1315,4 +1325,5 @@ def statistics_publications(
         })
 
     return {"statistics": result}
+
 
