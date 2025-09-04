@@ -10,6 +10,7 @@ from typing import List, Dict, Any, Optional, Tuple
 import hashlib
 import json
 from datetime import datetime, timezone
+from typing import Dict, Any, List
 from collections import defaultdict
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -158,7 +159,13 @@ def get_export_person_template() -> Dict[str, Any]:
     'name' is the exact Faculty string; start_year and end_year are optional inclusives.
     If 'name' is omitted, endpoint will return publications for ALL faculty (subject to year filters).
     """
-    return {"name": None, "start_year": None, "end_year": None}
+    return {
+        "name": None,
+        "start_year": None,
+        "end_year": None,
+        "publication_types": None,  # e.g. ["Book Chapter", "Journal Article"]
+        "affiliations": None,       # e.g. ["IED", "Some Dept"]
+    }
 
 
 # ---------------- DB init + migration ----------------
@@ -431,14 +438,16 @@ class ExportPersonPubsRequest(BaseModel):
     name: Optional[str] = Field(None, title="Exact Faculty name", description="Exact Faculty string to match; omit/null for all faculty")
     start_year: Optional[int] = Field(None, title="Start year (inclusive)")
     end_year: Optional[int] = Field(None, title="End year (inclusive)")
-
+    publication_types: Optional[List[str]] = Field(None, title="Publication types (list)", description="List of exact Publication Type strings to filter (OR).")
+    affiliations: Optional[List[str]] = Field(None, title="Affiliations (list)", description="List of exact Affiliation strings to filter (OR).")
 
 class ExportPublicationsExcelRequest(BaseModel):
     year: Optional[int] = Field(None, title="Year")
     start_year: Optional[int] = Field(None, title="Start year (inclusive)")
     end_year: Optional[int] = Field(None, title="End year (inclusive)")
     faculty: Optional[str] = Field(None, title="Faculty name")
-
+    publication_types: Optional[List[str]] = Field(None, title="Publication types (list)")
+    affiliations: Optional[List[str]] = Field(None, title="Affiliations (list)")
 
 class PersonStatisticsRequest(BaseModel):
     faculty: str
@@ -995,7 +1004,7 @@ def generate_person_pdf(name: str, rows: List[Dict[str, Any]], start_year: Optio
 
 
 # ---------------- new: export publications for a person as PDF ----------------
-@app.post("/export-person-pubs-pdf",dependencies=[Depends(authenticate)])
+@app.post("/export-person-pubs-pdf", dependencies=[Depends(authenticate)])
 def export_person_pubs_pdf(
     payload: Optional[ExportPersonPubsRequest] = Body(
         None,
@@ -1020,55 +1029,82 @@ def export_person_pubs_pdf(
     )
 ):
     """
-    Single endpoint:
-    - If called with no body (payload is null), returns a small template JSON explaining fields.
-    - If body provided:
-        - name (optional): exact Faculty string. If omitted or null => all faculty.
-        - start_year, end_year (optional): inclusive integer bounds for Year filtering.
-    Returns a PDF file containing matching publications.
+    Export publications for a person (or for ALL if name omitted).
+    Treats name="string" as not provided; year==0 as not provided; flattens comma lists; case-insensitive matching.
     """
-    # If payload is None -> return template so UI knows what to send
     if payload is None:
         return {
             "template": get_export_person_template(),
-            "note": "Provide 'name' (exact Faculty string) or omit/null for all faculty. 'start_year' and 'end_year' are optional inclusive integers."
+            "note": "Provide 'name' (exact Faculty string) or omit/null for all faculty. Use start_year/end_year (0 means not provided) or year."
         }
 
-    # Extract and normalize inputs
+    # normalize name
     name_raw = payload.name
-    name = name_raw.strip() if isinstance(name_raw, str) and name_raw.strip() != "" else None
+    name = None
+    if isinstance(name_raw, str):
+        nr = name_raw.strip()
+        if nr != "" and nr.lower() != "string":
+            name = nr
 
-    start_year = payload.start_year
-    end_year = payload.end_year
-    try:
-        start_year = int(start_year) if start_year is not None and str(start_year).strip() != "" else None
-    except Exception:
-        raise HTTPException(status_code=400, detail="start_year must be an integer or omitted.")
-    try:
-        end_year = int(end_year) if end_year is not None and str(end_year).strip() != "" else None
-    except Exception:
-        raise HTTPException(status_code=400, detail="end_year must be an integer or omitted.")
+    def to_nullable_year(v: Any) -> Optional[int]:
+        if v is None:
+            return None
+        try:
+            iv = int(v)
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"Year must be an integer or 0 to mean not provided: {v}")
+        return None if iv == 0 else iv
 
-    # Treat 0 as "not provided" to avoid accidental Year=0 filtering
-    if isinstance(start_year, int) and start_year == 0:
-        start_year = None
-    if isinstance(end_year, int) and end_year == 0:
-        end_year = None
+    start_year = to_nullable_year(payload.start_year)
+    end_year = to_nullable_year(payload.end_year)
 
-    # Query DB for optional Faculty match and optional Year range
+    def flatten_list_field(val: Optional[List[str]]) -> List[str]:
+        if not val:
+            return []
+        items: List[str] = []
+        for item in val:
+            if item is None:
+                continue
+            for part in str(item).split(","):
+                p = part.strip()
+                if not p or p.lower() == "string":
+                    continue
+                items.append(p)
+        seen = set()
+        out = []
+        for x in items:
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
+
+    publication_types = flatten_list_field(payload.publication_types)
+    affiliations = flatten_list_field(payload.affiliations)
+
+    # Build SQL with case-insensitive matching
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
-    # Base SQL
     sql = f"SELECT * FROM {TABLE_NAME}"
     params: List[Any] = []
-
-    # Build WHERE clauses depending on inputs
     where_clauses: List[str] = []
+
     if name is not None:
-        where_clauses.append("Faculty = ?")
-        params.append(name)
+        where_clauses.append("LOWER(Faculty) = ?")
+        params.append(name.lower())
+
+    if publication_types:
+        placeholders = ",".join("?" for _ in publication_types)
+        where_clauses.append(f'LOWER("Publication Type") IN ({placeholders})')
+        params.extend([p.lower() for p in publication_types])
+
+    if affiliations:
+        placeholders = ",".join("?" for _ in affiliations)
+        where_clauses.append(f'LOWER(Affiliation) IN ({placeholders})')
+        params.extend([a.lower() for a in affiliations])
+
+    # Year: apply even if name omitted
     if start_year is not None and end_year is not None:
         where_clauses.append("Year BETWEEN ? AND ?")
         params.extend([start_year, end_year])
@@ -1091,7 +1127,7 @@ def export_person_pubs_pdf(
     finally:
         conn.close()
 
-    # Normalize fields for PDF
+    # Normalize fields for PDF (unchanged)
     for p in publications:
         if p.get("Entry Date"):
             try:
@@ -1103,22 +1139,18 @@ def export_person_pubs_pdf(
                 p["Year"] = int(p["Year"])
             except Exception:
                 pass
-        # sanitize NaNs
         for k, v in list(p.items()):
             if pd.isna(v):
                 p[k] = None
 
-    # Build outfile path
     safe_name_part = _sanitize_filename_part(name if name is not None else "ALL")
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{safe_name_part}_publications_{ts}.pdf"
     out_path = os.path.join(UPLOAD_FOLDER, filename)
 
-    # Generate PDF
     try:
         generate_person_pdf(name if name is not None else "All Faculty", publications, start_year, end_year, out_path)
     except Exception as e:
-        # If PDF generation fails, ensure no partial file remains
         if os.path.exists(out_path):
             try:
                 os.remove(out_path)
@@ -1126,49 +1158,122 @@ def export_person_pubs_pdf(
                 pass
         raise HTTPException(status_code=500, detail=f"Failed to generate PDF: {e}")
 
-    # Return file response
     return FileResponse(out_path, filename=filename, media_type="application/pdf")
 
-@app.post("/export-publications-excel", response_class=FileResponse,dependencies=[Depends(authenticate)])
+
+
+
+@app.post("/export-publications-excel", response_class=FileResponse, dependencies=[Depends(authenticate)])
 def export_publications_excel(payload: ExportPublicationsExcelRequest = Body(...)):
     """
     Export publications as an Excel file.
-    Optional filters:
-      - year (single year)
-      - start_year, end_year (range, inclusive)
-      - faculty (exact name match)
+
+    Behavior changes/fixes:
+      - Treat year == 0 as "not provided" (so it won't conflict with start_year/end_year).
+      - start_year/end_year: 0 treated as not provided.
+      - publication_types/affiliations accept list elements or comma-separated strings.
+      - placeholder literal "string" (case-insensitive) is ignored.
+      - Matching is case-insensitive for Faculty/Publication Type/Affiliation.
     """
+    # helper: treat 0 as "not provided"
+    def to_nullable_year_field(v: Any) -> Optional[int]:
+        if v is None:
+            return None
+        try:
+            iv = int(v)
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"Invalid integer for year field: {v}")
+        return None if iv == 0 else iv
+
+    # parse year (treat 0 as None)
+    year = None
+    if payload.year is not None:
+        try:
+            yv = int(payload.year)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid 'year' value")
+        year = None if yv == 0 else yv
+
+    start_year = to_nullable_year_field(payload.start_year)
+    end_year = to_nullable_year_field(payload.end_year)
+
+    # flatten helper for publication_types/affiliations and drop placeholder "string"
+    def flatten_list_field(val: Optional[List[str]]) -> List[str]:
+        if not val:
+            return []
+        items: List[str] = []
+        for item in val:
+            if item is None:
+                continue
+            for part in str(item).split(","):
+                p = part.strip()
+                # drop placeholder literal "string" (case-insensitive)
+                if not p or p.lower() == "string":
+                    continue
+                items.append(p)
+        # dedupe preserving order
+        seen = set()
+        out = []
+        for x in items:
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
+
+    publication_types = flatten_list_field(payload.publication_types)
+    affiliations = flatten_list_field(payload.affiliations)
+
+    # guard: don't allow providing 'year' together with start/end range
+    # (year already treated as None if it was 0)
+    if year is not None and (start_year is not None or end_year is not None):
+        raise HTTPException(
+            status_code=400,
+            detail="Please provide either 'year' OR 'start_year'/'end_year', not both."
+        )
+
+    # faculty: treat empty string or literal "string" (case-insensitive placeholder) as not provided
+    faculty_raw = payload.faculty if payload.faculty is not None else ""
+    faculty = None
+    if isinstance(faculty_raw, str):
+        fr = faculty_raw.strip()
+        if fr != "" and fr.lower() != "string":
+            faculty = fr
+
+    # Build SQL (use case-insensitive matching via LOWER(...))
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
     sql = f"SELECT * FROM {TABLE_NAME}"
-    params = []
-    where_clauses = []
+    params: List[Any] = []
+    where_clauses: List[str] = []
 
-    # Apply filters
-    if payload.year and (payload.start_year or payload.end_year):
-        raise HTTPException(
-            status_code=400,
-            detail="Please provide either 'year' OR 'start_year'/'end_year', not both."
-        )
-    if payload.faculty and payload.faculty.strip() != "":
-        where_clauses.append("Faculty = ?")
-        params.append(payload.faculty.strip())
+    if faculty:
+        where_clauses.append("LOWER(Faculty) = ?")
+        params.append(faculty.lower())
 
+    if publication_types:
+        placeholders = ",".join("?" for _ in publication_types)
+        where_clauses.append(f'LOWER("Publication Type") IN ({placeholders})')
+        params.extend([p.lower() for p in publication_types])
 
-    if payload.year and payload.year > 0:
+    if affiliations:
+        placeholders = ",".join("?" for _ in affiliations)
+        where_clauses.append(f'LOWER(Affiliation) IN ({placeholders})')
+        params.extend([a.lower() for a in affiliations])
+
+    if year is not None:
         where_clauses.append("Year = ?")
-        params.append(payload.year)
-    elif payload.start_year and payload.end_year and payload.start_year > 0 and payload.end_year > 0:
+        params.append(year)
+    elif start_year is not None and end_year is not None:
         where_clauses.append("Year BETWEEN ? AND ?")
-        params.extend([payload.start_year, payload.end_year])
-    elif payload.start_year and payload.start_year > 0:
+        params.extend([start_year, end_year])
+    elif start_year is not None:
         where_clauses.append("Year >= ?")
-        params.append(payload.start_year)
-    elif payload.end_year and payload.end_year > 0:
+        params.append(start_year)
+    elif end_year is not None:
         where_clauses.append("Year <= ?")
-        params.append(payload.end_year)
+        params.append(end_year)
 
     if where_clauses:
         sql += " WHERE " + " AND ".join(where_clauses)
@@ -1190,12 +1295,19 @@ def export_publications_excel(payload: ExportPublicationsExcelRequest = Body(...
     # Build filename
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     filter_part = []
-    if payload.faculty:
-        filter_part.append(payload.faculty.replace(" ", "_"))
-    if payload.year:
-        filter_part.append(str(payload.year))
-    elif payload.start_year or payload.end_year:
-        filter_part.append(f"{payload.start_year or ''}-{payload.end_year or ''}")
+    if faculty:
+        filter_part.append(faculty.replace(" ", "_"))
+    if year:
+        filter_part.append(str(year))
+    elif start_year or end_year:
+        filter_part.append(f"{start_year or ''}-{end_year or ''}")
+
+    if publication_types:
+        pts = [p.replace(" ", "_") for p in publication_types][:5]
+        filter_part.append("PT-" + "+".join(pts))
+    if affiliations:
+        affs = [a.replace(" ", "_") for a in affiliations][:5]
+        filter_part.append("AFF-" + "+".join(affs))
 
     filter_str = "_".join(filter_part) if filter_part else "ALL"
     filename = f"publications_{filter_str}_{ts}.xlsx"
@@ -1209,6 +1321,9 @@ def export_publications_excel(payload: ExportPublicationsExcelRequest = Body(...
         filename=filename,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
+
+
 
 @app.post("/statistics/person", response_model=PersonStatisticsResponse)
 def get_person_statistics(payload: PersonStatisticsRequest = Body(...)):
@@ -1256,25 +1371,79 @@ def get_person_statistics(payload: PersonStatisticsRequest = Body(...)):
 @app.get("/statistics/publications")
 def statistics_publications(
     start_year: int = Query(None, description="Filter publications from this year onwards"),
-    end_year: int = Query(None, description="Filter publications up to this year")
+    end_year: int = Query(None, description="Filter publications up to this year"),
+    publication_types: Optional[List[str]] = Query(None, description="Publication types (repeatable or comma-separated)"),
+    affiliations: Optional[List[str]] = Query(None, description="Affiliations (repeatable or comma-separated)")
 ):
+    """
+    Return publication statistics by year with optional multi-value filters:
+      - publication_types: OR semantics within list
+      - affiliations: OR semantics within list
+      - Year filters still apply
+    Also returns the actual filters applied in `filters_applied` for frontend use.
+    """
+    # --- helpers ---
+    def flatten_query_list(raw: Optional[List[str]]) -> List[str]:
+        """Accept repeated query params or comma-separated items; dedupe and ignore placeholder 'string'."""
+        if not raw:
+            return []
+        items: List[str] = []
+        for item in raw:
+            if item is None:
+                continue
+            for part in str(item).split(","):
+                p = part.strip()
+                if not p:
+                    continue
+                if p.lower() == "string":  # placeholder from docs — ignore it
+                    continue
+                items.append(p)
+        # dedupe preserving order but case-insensitive uniqueness
+        seen_lowers = set()
+        out = []
+        for x in items:
+            key = x.lower()
+            if key not in seen_lowers:
+                seen_lowers.add(key)
+                out.append(x)
+        return out
+
+    ptypes = flatten_query_list(publication_types)
+    affs = flatten_query_list(affiliations)
+
+    # Build SQL with case-insensitive matching where applicable
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
-    sql = f"SELECT Year, Title, Faculty FROM {TABLE_NAME}"
-    params = []
-    where_clauses = []
+    sql = f"SELECT Year, Title, Faculty, \"Publication Type\", Affiliation FROM {TABLE_NAME}"
+    params: List[Any] = []
+    where_clauses: List[str] = []
 
-    if start_year:
+    # Year filters (apply even when other filters absent)
+    if start_year is not None:
         where_clauses.append("Year >= ?")
         params.append(start_year)
-    if end_year:
+    if end_year is not None:
         where_clauses.append("Year <= ?")
         params.append(end_year)
 
+    # Publication types (case-insensitive)
+    if ptypes:
+        placeholders = ",".join("?" for _ in ptypes)
+        where_clauses.append(f'LOWER("Publication Type") IN ({placeholders})')
+        params.extend([p.lower() for p in ptypes])
+
+    # Affiliations (case-insensitive)
+    if affs:
+        placeholders = ",".join("?" for _ in affs)
+        where_clauses.append(f'LOWER(Affiliation) IN ({placeholders})')
+        params.extend([a.lower() for a in affs])
+
     if where_clauses:
         sql += " WHERE " + " AND ".join(where_clauses)
+
+    sql += ' ORDER BY Year DESC, "Entry Date" DESC, Title ASC'
 
     cur.execute(sql, tuple(params))
     rows = cur.fetchall()
@@ -1287,23 +1456,27 @@ def statistics_publications(
     year_stats = {}
     for row in rows:
         year = row["Year"]
-        title = row["Title"] or ""
-        faculty = row["Faculty"] or ""
+        title = (row["Title"] or "").strip()
+        faculty = (row["Faculty"] or "").strip()
 
-        # use str(year) for grouping of None/int; but keep int if possible
-        ykey = year if (isinstance(year, int) or (isinstance(year, str) and year.isdigit())) else None
+        # normalize year key: try to use int if possible else None
+        try:
+            ykey = int(year) if year is not None and str(year).strip() != "" and str(year).strip().isdigit() else None
+        except Exception:
+            ykey = None
 
         if ykey not in year_stats:
             year_stats[ykey] = {"publications": 0, "contributors": set(), "authors_per_pub": {}}
         year_stats[ykey]["publications"] += 1
         if faculty:
             year_stats[ykey]["contributors"].add(faculty)
+        # authors per pub: use title as key
         if title not in year_stats[ykey]["authors_per_pub"]:
             year_stats[ykey]["authors_per_pub"][title] = set()
         if faculty:
             year_stats[ykey]["authors_per_pub"][title].add(faculty)
 
-    # Build response sorted by year (None goes last)
+    # Build response sorted by year (None last)
     sorted_years = sorted([y for y in year_stats.keys() if y is not None], reverse=True)
     if None in year_stats:
         sorted_years.append(None)
@@ -1324,6 +1497,27 @@ def statistics_publications(
             "average_authors_per_publication": round(avg_authors, 2)
         })
 
-    return {"statistics": result}
+    # Build filters_applied: categories + actual lists for frontend
+    categories = 0
+    if start_year is not None or end_year is not None:
+        categories += 1
+    if ptypes:
+        categories += 1
+    if affs:
+        categories += 1
+
+    filters_detail = {
+        "categories": categories,
+        "publication_types": ptypes,   # list of actual publication type filters applied
+        "affiliations": affs,          # list of actual affiliation filters applied
+        "year_filter_applied": bool(start_year is not None or end_year is not None)
+    }
+
+    return {
+        "statistics": result,
+        "filters_applied": filters_detail
+    }
+
+
 
 
