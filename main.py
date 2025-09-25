@@ -1381,6 +1381,9 @@ def statistics_publications(
       - affiliations: OR semantics within list
       - Year filters still apply
     Also returns the actual filters applied in `filters_applied` for frontend use.
+
+    Important change: publications are deduplicated per year by normalized Title (lowercased + stripped)
+    so a single publication entered multiple times (multiple authors) is counted once.
     """
     # --- helpers ---
     def flatten_query_list(raw: Optional[List[str]]) -> List[str]:
@@ -1452,11 +1455,19 @@ def statistics_publications(
     if not rows:
         raise HTTPException(status_code=404, detail="No publications found for the given filters")
 
-    # Aggregate while handling None years safely
+    # Aggregate while handling None years safely.
+    # KEY CHANGE: deduplicate publications per year by normalized title.
+    # year_stats[ykey] structure:
+    #   - "publications": int (number of unique titles)
+    #   - "contributors": set() (unique faculties seen within the year & filters)
+    #   - "authors_per_pub": dict(norm_title -> set(faculty names))
     year_stats = {}
     for row in rows:
         year = row["Year"]
-        title = (row["Title"] or "").strip()
+        raw_title = (row["Title"] or "").strip()
+        # Normalize title for deduplication: lower + strip
+        norm_title = raw_title.lower()
+
         faculty = (row["Faculty"] or "").strip()
 
         # normalize year key: try to use int if possible else None
@@ -1465,16 +1476,24 @@ def statistics_publications(
         except Exception:
             ykey = None
 
+        # initialize container for this year
         if ykey not in year_stats:
-            year_stats[ykey] = {"publications": 0, "contributors": set(), "authors_per_pub": {}}
-        year_stats[ykey]["publications"] += 1
+            year_stats[ykey] = {
+                "publications": 0,
+                "contributors": set(),
+                "authors_per_pub": {}  # norm_title -> set of faculties
+            }
+
+        # If this normalized title hasn't been seen yet for this year, create entry and count it once
+        if norm_title not in year_stats[ykey]["authors_per_pub"]:
+            year_stats[ykey]["authors_per_pub"][norm_title] = set()
+            year_stats[ykey]["publications"] += 1
+
+        # Add faculty to global contributors set for the year
         if faculty:
             year_stats[ykey]["contributors"].add(faculty)
-        # authors per pub: use title as key
-        if title not in year_stats[ykey]["authors_per_pub"]:
-            year_stats[ykey]["authors_per_pub"][title] = set()
-        if faculty:
-            year_stats[ykey]["authors_per_pub"][title].add(faculty)
+            # Add faculty to this publication's authors set
+            year_stats[ykey]["authors_per_pub"][norm_title].add(faculty)
 
     # Build response sorted by year (None last)
     sorted_years = sorted([y for y in year_stats.keys() if y is not None], reverse=True)
@@ -1486,6 +1505,7 @@ def statistics_publications(
         stats = year_stats[year]
         pub_count = stats["publications"]
         contributors_count = len(stats["contributors"])
+        # average authors per publication: average size of authors sets across unique titles
         avg_authors = (
             sum(len(authors) for authors in stats["authors_per_pub"].values()) /
             max(1, len(stats["authors_per_pub"]))
